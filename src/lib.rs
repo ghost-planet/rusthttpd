@@ -1,4 +1,8 @@
 mod threadpool;
 mod webserver;
 
-pub use webserver::WebServer;
+use webserver::WebServer;
+
+pub fn run(addr: &str, threads: usize) -> std::io::Result<()> {
+    WebServer::new(addr, threads).run()
+}
