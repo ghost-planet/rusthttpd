@@ -1,6 +1,7 @@
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::io::{Read, Write};
 use std::fs;
+use std::process::Command;
 use super::threadpool::ThreadPool;
 
 const SERVER_STRING: &[u8] = b"Server: rustweb/0.1.0\r\n";
@@ -43,15 +44,31 @@ impl WebServer {
             }
 
             let skip = method.len() + 1;
-            let url: String = request_line.clone().skip(skip).take_while(|c| !c.is_whitespace()).collect();
+            let mut url: String = request_line.clone().skip(skip).take_while(|c| !c.is_whitespace()).collect();
+
+            let mut query_string: Option<String> = None;
+            if let Some(pos) = url.find("?") {
+                query_string = Some(url[pos+1..].to_string());
+                url = url[..pos].to_string();
+            }
 
             let skip = skip + url.len() + 1;
-            let _protocol: String = request_line.clone().skip(skip).take_while(|c| !c.is_whitespace()).collect(); 
+            let _protocol: String = request_line.clone().skip(skip).take_while(|c| !c.is_whitespace()).collect();
+            
+            // Get: read all the heads
+            loop {
+                let line = WebServer::read_line(&mut socket, &mut buffer[..]);
+                if line.len() == 0 {
+                    break;
+                }
+            }
 
             let path = WebServer::url_to_path(&url);
             
             if path.is_none() {
                 WebServer::not_found(&mut socket, &url);
+            } else if let Some(query_string) = query_string {
+                WebServer::execute_cgi(&mut socket, &path.unwrap(), &query_string);
             } else {
                 WebServer::serve_file(&mut socket, &path.unwrap());
             }
@@ -82,6 +99,7 @@ impl WebServer {
     }
 
     fn unimplemented(socket: &mut TcpStream) {
+        // 返回 501
         socket.write_all(b"HTTP/1.1 501 Method Not Implemented\r\n").unwrap();
         socket.write_all(SERVER_STRING).unwrap();
         socket.write_all(b"Content-Type: text/html\r\n").unwrap();
@@ -104,6 +122,18 @@ impl WebServer {
         socket.flush().unwrap();
     }
 
+    fn cannot_exectute(socket: &mut TcpStream, _url: &str) {
+        //返回500
+        socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\n").unwrap();
+        socket.write_all(SERVER_STRING).unwrap();
+        socket.write_all(b"Content-Type: text/html\r\n").unwrap();
+        socket.write_all(b"\r\n").unwrap();
+
+        WebServer::write_file(socket, "assets/500.html");
+
+        socket.flush().unwrap();
+    }
+
     fn serve_file(socket: &mut TcpStream, url: &str) {
         //返回 200
         socket.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
@@ -112,6 +142,20 @@ impl WebServer {
         socket.write_all(b"\r\n").unwrap();
 
         WebServer::write_file(socket, url);
+
+        socket.flush().unwrap();
+    }
+
+    fn execute_cgi(socket: &mut TcpStream, url: &str, query_string: &str) {
+        let output = Command::new(url).env("QUERY_STRING", query_string).output();
+
+        if let Ok(output) = output {
+            socket.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+            socket.write_all(SERVER_STRING).unwrap();
+            socket.write_all(&output.stdout).unwrap();
+        } else {
+            WebServer::cannot_exectute(socket, url);
+        }
 
         socket.flush().unwrap();
     }
