@@ -1,4 +1,4 @@
-use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::net::{TcpListener, TcpStream, SocketAddr, ToSocketAddrs};
 use std::io::{Read, Write};
 use std::fs;
 use std::process::{Command, Stdio};
@@ -8,98 +8,58 @@ use super::threadpool::ThreadPool;
 const SERVER_STRING: &[u8] = b"Server: rustweb/0.1.0\r\n";
 
 pub struct WebServer {
-    addr: String,
     threadpool: ThreadPool,
 }
 
 impl WebServer {
-    pub fn new(addr: &str, threads: usize) -> Self {
+    pub fn new(nthreads: usize) -> Self {
         Self {
-            addr: addr.to_string(),
-            threadpool: ThreadPool::new(threads),
+            threadpool: ThreadPool::new(nthreads),
         }
     }
 
-    pub fn run(&self) -> std::io::Result<()> {
-        let listener = TcpListener::bind(&self.addr)?;
+    pub fn run<A: ToSocketAddrs>(&self, addr: A) -> std::io::Result<()> {
+        let listener = TcpListener::bind(addr)?;
         loop {
             match listener.accept() {
-                Ok((socket, addr)) => self.handle_client(socket, addr),
-                Err(e) => eprintln!("Client connect failed for {}", e),
+                Ok((socket, addr)) => {
+                    println!("Request from {}", addr);
+                    self.handle_client(socket, addr);
+                }
+                Err(e) => return Err(e),
             }
         }
     }
 
-    fn handle_client(&self, mut socket: TcpStream, addr: SocketAddr) {
+    fn handle_client(&self, mut socket: TcpStream, _addr: SocketAddr) {
         self.threadpool.execute(move || {
-            println!("Request from {}", addr);
-
             let mut buffer = [0; 1024];
             let request_line = WebServer::read_line(&mut socket, &mut buffer[..]);
-            let request_line = request_line.iter()
-                                            .map(|c| {
-                                                    let c = *c as char;
-                                                    c.to_ascii_uppercase()
-                                                });
+            let (method, url, _protocol, query_string) = WebServer::parse_reqeust_line(request_line);
 
-            let method: String = request_line.clone().take_while(|c| !c.is_whitespace()).collect();
             if method != "GET" && method != "POST" {
                 WebServer::unimplemented(&mut socket);
                 return;
             }
 
-            let skip = method.len() + 1;
-            let mut url: String = request_line.clone().skip(skip).take_while(|c| !c.is_whitespace()).collect();
-
-            let mut query_string: Option<String> = None;
-            if let Some(pos) = url.find("?") {
-                query_string = Some(url[pos+1..].to_string());
-                url = url[..pos].to_string();
-            }
-
-            let skip = skip + url.len() + 1;
-            let _protocol: String = request_line.clone().skip(skip).take_while(|c| !c.is_whitespace()).collect();
-            
             let path = WebServer::url_to_path(&url);
             
             if path.is_none() {
                 WebServer::discard_all_headers(&mut socket);
                 WebServer::not_found(&mut socket, &url);
+                return;
+            }
+
+            let path = path.unwrap();
+            let cgi = WebServer::file_executable(&path) || query_string.is_some();
+            
+            if cgi {
+                WebServer::execute_cgi(&mut socket, &path, &method, &query_string.unwrap_or_default());
             } else {
-                let path = path.unwrap();
-                let cgi = WebServer::file_executable(&path) || query_string.is_some();
-                
-                if cgi {
-                    WebServer::execute_cgi(&mut socket, &path, &method, &query_string.unwrap_or_default());
-                } else {
-                    WebServer::discard_all_headers(&mut socket);
-                    WebServer::serve_file(&mut socket, &path);
-                }
+                WebServer::discard_all_headers(&mut socket);
+                WebServer::serve_file(&mut socket, &path);
             }
         });
-    }
-
-    fn read_line<'a>(socket: &mut TcpStream, buf: &'a mut [u8]) -> &'a [u8] {
-        let mut iter = socket.bytes().peekable();
-        let mut i = 0;
-        while i < buf.len() {
-            let next = iter.next();
-            match next {
-                Some(Ok(v)) if v != b'\n' && v != b'\r' => {
-                    buf[i] = v;
-                    i += 1;
-                },
-                Some(Ok(v)) if v == b'\r' => {
-                    if let Some(Ok(b'\n')) = iter.peek() {
-                        iter.next();
-                    }
-                    break;
-                }
-                _ => break,
-            }
-        }
-
-        &buf[0..i]
     }
 
     fn unimplemented(socket: &mut TcpStream) {
@@ -231,6 +191,29 @@ impl WebServer {
         socket.flush().unwrap();
     }
 
+    fn read_line<'a>(socket: &mut TcpStream, buf: &'a mut [u8]) -> &'a [u8] {
+        let mut iter = socket.bytes().peekable();
+        let mut i = 0;
+        while i < buf.len() {
+            let next = iter.next();
+            match next {
+                Some(Ok(v)) if v != b'\n' && v != b'\r' => {
+                    buf[i] = v;
+                    i += 1;
+                },
+                Some(Ok(v)) if v == b'\r' => {
+                    if let Some(Ok(b'\n')) = iter.peek() {
+                        iter.next();
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+
+        &buf[0..i]
+    }
+
     fn discard_all_headers(socket: &mut TcpStream) {
         let mut buffer = [0; 1024];
         loop {
@@ -286,5 +269,29 @@ impl WebServer {
         const IXOTH: u32 =  0o001;
         
         (mode & IXUSR) > 0 || (mode & IXGRP) > 0 || (mode & IXOTH) > 0
+    }
+
+    fn parse_reqeust_line(line: &[u8]) -> (String, String, String, Option<String>) {
+        let line = line.iter()
+                                .map(|c| {
+                                    let c = *c as char;
+                                    c.to_ascii_uppercase()
+                                });
+
+        let method: String = line.clone().take_while(|c| !c.is_whitespace()).collect();
+        
+        let skip = method.len() + 1;
+        let mut url: String = line.clone().skip(skip).take_while(|c| !c.is_whitespace()).collect();
+
+        let mut query_string: Option<String> = None;
+        if let Some(pos) = url.find("?") {
+            query_string = Some(url[pos+1..].to_string());
+            url = url[..pos].to_string();
+        }
+
+        let skip = skip + url.len() + 1;
+        let protocol: String = line.clone().skip(skip).take_while(|c| !c.is_whitespace()).collect();
+        
+        (method, url, protocol, query_string)
     }
 }
