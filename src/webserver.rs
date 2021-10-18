@@ -1,5 +1,6 @@
 use std::net::{TcpListener, TcpStream, SocketAddr, ToSocketAddrs};
 use std::io::{Read, Write};
+use std::io::Result as IOResult;
 use std::fs;
 use std::process::{Command, Stdio};
 use std::os::unix::fs::PermissionsExt;
@@ -18,7 +19,7 @@ impl WebServer {
         }
     }
 
-    pub fn run<A: ToSocketAddrs>(&self, addr: A) -> std::io::Result<()> {
+    pub fn run<A: ToSocketAddrs>(&self, addr: A) -> IOResult<()> {
         let listener = TcpListener::bind(addr)?;
         loop {
             match listener.accept() {
@@ -31,111 +32,123 @@ impl WebServer {
         }
     }
 
-    fn handle_client(&self, mut socket: TcpStream, _addr: SocketAddr) {
-        self.threadpool.execute(move || {
+    fn handle_client(&self, mut socket: TcpStream, addr: SocketAddr) {
+        let mut f = move || {
             let mut buffer = [0; 1024];
-            let request_line = WebServer::read_line(&mut socket, &mut buffer[..]);
+            let request_line = WebServer::read_line(&mut socket, &mut buffer[..])?;
             let (method, url, _protocol, query_string) = WebServer::parse_reqeust_line(request_line);
 
             if method != "GET" && method != "POST" {
-                WebServer::unimplemented(&mut socket);
-                return;
+                return WebServer::unimplemented(&mut socket);
             }
 
             let path = WebServer::url_to_path(&url);
-            
             if path.is_none() {
-                WebServer::discard_all_headers(&mut socket);
-                WebServer::not_found(&mut socket, &url);
-                return;
+                WebServer::discard_all_headers(&mut socket)?;
+                return WebServer::not_found(&mut socket, &url);
             }
 
             let path = path.unwrap();
-            let cgi = WebServer::file_executable(&path) || query_string.is_some();
-            
-            if cgi {
-                WebServer::execute_cgi(&mut socket, &path, &method, &query_string.unwrap_or_default());
+            if WebServer::file_executable(&path) || query_string.is_some() {
+                return WebServer::execute_cgi(&mut socket, &path, &method, &query_string.unwrap_or_default());
             } else {
-                WebServer::discard_all_headers(&mut socket);
-                WebServer::serve_file(&mut socket, &path);
+                WebServer::discard_all_headers(&mut socket)?;
+                return WebServer::serve_file(&mut socket, &path);
+            }
+        };
+        self.threadpool.execute(move || {
+            let result = f();
+            if let Err(e) =  result {
+                eprintln!("Handle request from {} failed for {}", addr, e);
+            } else {
+                println!("Responsed request from {}", addr);
             }
         });
     }
 
-    fn unimplemented(socket: &mut TcpStream) {
+    fn unimplemented(socket: &mut TcpStream) -> IOResult<()> {
         // 返回 501
-        socket.write_all(b"HTTP/1.1 501 Method Not Implemented\r\n").unwrap();
-        socket.write_all(SERVER_STRING).unwrap();
-        socket.write_all(b"Content-Type: text/html\r\n").unwrap();
-        socket.write_all(b"\r\n").unwrap();
+        socket.write_all(b"HTTP/1.1 501 Method Not Implemented\r\n")?;
+        socket.write_all(SERVER_STRING)?;
+        socket.write_all(b"Content-Type: text/html\r\n")?;
+        socket.write_all(b"\r\n")?;
 
-        WebServer::write_file(socket, "assets/501.html");
+        WebServer::write_file(socket, "assets/501.html")?;
 
-        socket.flush().unwrap();
+        socket.flush()?;
+        Ok(())
     }
 
-    fn not_found(socket: &mut TcpStream, _url: &str) {
+    fn not_found(socket: &mut TcpStream, _url: &str) -> IOResult<()> {
         //返回404
-        socket.write_all(b"HTTP/1.1 404 NOT FOUND\r\n").unwrap();
-        socket.write_all(SERVER_STRING).unwrap();
-        socket.write_all(b"Content-Type: text/html\r\n").unwrap();
-        socket.write_all(b"\r\n").unwrap();
+        socket.write_all(b"HTTP/1.1 404 NOT FOUND\r\n")?;
+        socket.write_all(SERVER_STRING)?;
+        socket.write_all(b"Content-Type: text/html\r\n")?;
+        socket.write_all(b"\r\n")?;
 
-        WebServer::write_file(socket, "assets/404.html");
+        WebServer::write_file(socket, "assets/404.html")?;
 
-        socket.flush().unwrap();
+        socket.flush()?;
+        Ok(())
     }
 
-    fn cannot_exectute(socket: &mut TcpStream, _url: &str) {
+    fn cannot_exectute(socket: &mut TcpStream, _url: &str) -> IOResult<()> {
         //返回500
-        socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\n").unwrap();
-        socket.write_all(SERVER_STRING).unwrap();
-        socket.write_all(b"Content-Type: text/html\r\n").unwrap();
-        socket.write_all(b"\r\n").unwrap();
+        socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\n")?;
+        socket.write_all(SERVER_STRING)?;
+        socket.write_all(b"Content-Type: text/html\r\n")?;
+        socket.write_all(b"\r\n")?;
 
-        WebServer::write_file(socket, "assets/500.html");
+        WebServer::write_file(socket, "assets/500.html")?;
 
-        socket.flush().unwrap();
+        socket.flush()?;
+        Ok(())
     }
 
-    fn serve_file(socket: &mut TcpStream, url: &str) {
+    fn serve_file(socket: &mut TcpStream, url: &str) -> IOResult<()> {
         //返回 200
-        socket.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
-        socket.write_all(SERVER_STRING).unwrap();
-        socket.write_all(b"Content-Type: text/html\r\n").unwrap();
-        socket.write_all(b"\r\n").unwrap();
+        socket.write_all(b"HTTP/1.1 200 OK\r\n")?;
+        socket.write_all(SERVER_STRING)?;
+        socket.write_all(b"Content-Type: text/html\r\n")?;
+        socket.write_all(b"\r\n")?;
 
-        WebServer::write_file(socket, url);
+        WebServer::write_file(socket, url)?;
 
-        socket.flush().unwrap();
+        socket.flush()?;
+        Ok(())
     }
 
-    fn bad_request(socket: &mut TcpStream, _url: &str) {
+    fn bad_request(socket: &mut TcpStream, _url: &str) -> IOResult<()> {
         //返回400
-        socket.write_all(b"HTTP/1.1 400 Bad Request\r\n").unwrap();
-        socket.write_all(SERVER_STRING).unwrap();
-        socket.write_all(b"Content-Type: text/html\r\n").unwrap();
-        socket.write_all(b"\r\n").unwrap();
+        socket.write_all(b"HTTP/1.1 400 Bad Request\r\n")?;
+        socket.write_all(SERVER_STRING)?;
+        socket.write_all(b"Content-Type: text/html\r\n")?;
+        socket.write_all(b"\r\n")?;
 
-        WebServer::write_file(socket, "assets/400.html");
+        WebServer::write_file(socket, "assets/400.html")?;
 
-        socket.flush().unwrap(); 
+        socket.flush()?;
+        Ok(()) 
     }
 
-    fn execute_cgi(socket: &mut TcpStream, url: &str, method: &str, query_string: &str) {
+    fn execute_cgi(socket: &mut TcpStream, url: &str, method: &str, query_string: &str) -> IOResult<()> {
         let mut command = Command::new(url);
         command.env("REQUEST_METHOD", method);
 
         let output;
         if method == "GET" {
-            WebServer::discard_all_headers(socket);
+            WebServer::discard_all_headers(socket)?;
             output = command.env("QUERY_STRING", query_string).output();
         } else {
             let mut buffer = [0;1024];
 
             let mut content_length = loop {
                 let line = WebServer::read_line(socket, &mut buffer[..]);
-                
+                if let Err(e) = line {
+                    return Err(e);
+                }
+
+                let line = line.unwrap();
                 if line.len() == 0 {
                     break -1;
                 }
@@ -151,13 +164,12 @@ impl WebServer {
                 }
             };
 
+            WebServer::discard_all_headers(socket)?;
+
             if content_length == -1 {
-                WebServer::discard_all_headers(socket);
-                WebServer::bad_request(socket, url);
-                return;
+                return WebServer::bad_request(socket, url);
             }
 
-            WebServer::discard_all_headers(socket);
             if let Ok(process) = command.env("CONTENT_LENGTH", content_length.to_string())
                                         .stdin(Stdio::piped())
                                         .stdout(Stdio::piped())
@@ -168,30 +180,29 @@ impl WebServer {
                     content_length -= read;
                     
                     let read = read as usize;
-                    socket.read_exact(&mut buffer[0..read]).unwrap();
-                    stdin.write_all(&buffer[0..read]).unwrap();
+                    socket.read_exact(&mut buffer[0..read])?;
+                    stdin.write_all(&buffer[0..read])?;
                 }
 
                 output = process.wait_with_output();
             } else {
-                WebServer::cannot_exectute(socket, url);
-                return;
+                return WebServer::cannot_exectute(socket, url);
             }
         }
         
         match output {
             Ok(output) if output.status.success() => {
-                socket.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
-                socket.write_all(SERVER_STRING).unwrap();
-                socket.write_all(&output.stdout).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\n")?;
+                socket.write_all(SERVER_STRING)?;
+                socket.write_all(&output.stdout)?;
+                socket.flush()?;
+                Ok(())
             },
             _ => WebServer::cannot_exectute(socket, url),
-        };
-        
-        socket.flush().unwrap();
+        }
     }
 
-    fn read_line<'a>(socket: &mut TcpStream, buf: &'a mut [u8]) -> &'a [u8] {
+    fn read_line<'a>(socket: &mut TcpStream, buf: &'a mut [u8]) -> IOResult<&'a [u8]> {
         let mut iter = socket.bytes().peekable();
         let mut i = 0;
         while i < buf.len() {
@@ -207,32 +218,42 @@ impl WebServer {
                     }
                     break;
                 }
-                _ => break,
+                Some(Ok(_)) => break,
+                Some(Err(e)) => return Err(e),
+                _ => {
+                    // It must never reach here
+                    assert!(false);
+                    break;
+                },
             }
         }
 
-        &buf[0..i]
+        Ok(&buf[0..i])
     }
 
-    fn discard_all_headers(socket: &mut TcpStream) {
+    fn discard_all_headers(socket: &mut TcpStream) -> IOResult<()> {
         let mut buffer = [0; 1024];
         loop {
-            let line = WebServer::read_line(socket, &mut buffer[..]);
+            let line = WebServer::read_line(socket, &mut buffer[..])?;
             if line.len() == 0 {
                 break;
             }
         }
+
+        Ok(())
     }
 
-    fn write_file(socket: &mut TcpStream, url: &str) {
-        let mut f = fs::File::open(url).unwrap();
+    fn write_file(socket: &mut TcpStream, url: &str) -> IOResult<()> {
+        let mut f = fs::File::open(url)?;
         let mut buf: [u8; 1024] = [0; 1024];
-        while let Ok(size) = f.read(&mut buf) {
+        loop {
+            let size = f.read(&mut buf)?;
             if size == 0 {
                 break;
             }
-            socket.write_all(&buf[0..size]).unwrap();
+            socket.write_all(&buf[0..size])?;
         }
+        Ok(())
     }
 
     fn url_to_path(url: &str) -> Option<String> {
@@ -241,13 +262,14 @@ impl WebServer {
             path = path + "index.html";
         }
 
-        let mut metadata = fs::metadata(path.clone());
-        if let Ok(ref data) = metadata {
-            if data.is_dir() {
+        let mut metadata = fs::metadata(&path);
+        match metadata {
+            Ok(ref data) if data.is_dir() => {
                 path = path + "/index.html";
-                metadata = fs::metadata(path.clone());
+                metadata = fs::metadata(&path);
             }
-        }
+            _ => (),
+        };
 
         match metadata {
             Ok(ref data) if data.is_file() => Some(path),
@@ -261,8 +283,7 @@ impl WebServer {
             return false;
         }
         
-        let metadata = metadata.unwrap();
-        let mode = metadata.permissions().mode();
+        let mode = metadata.unwrap().permissions().mode();
 
         const IXUSR: u32 =  0o100;
         const IXGRP: u32 =  0o010;
