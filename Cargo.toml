@@ -1,5 +1,5 @@
 [package]
-name = "rustweb"
+name = "rusthttpd"
 version = "0.1.0"
 authors = ["VincentGong <VicentGong@boyaa.com>"]
 edition = "2018"

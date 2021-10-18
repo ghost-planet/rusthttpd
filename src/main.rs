@@ -24,7 +24,7 @@ fn main() {
     let threads = matches.value_of("THREADS").unwrap_or_default();
     let threads: usize = threads.parse().unwrap_or(8);
 
-    if let Err(e) = rustweb::run(addr, threads) {
+    if let Err(e) = rusthttpd::run(addr, threads) {
         eprintln!("Run webserver failed for {}.", e);
         process::exit(1);
     }
